@@ -49,6 +49,9 @@ type ConfigWrite struct {
 	OutOfOrder      bool
 	Concurrency     int
 	WriteV2         bool
+	TimeRangeStart  *time.Time
+	TimeRangeEnd    *time.Time
+	SampleInterval  time.Duration
 }
 
 func NewWriteConfigFromFlags(flagReg func(name, help string) *kingpin.FlagClause) *ConfigWrite {
@@ -74,6 +77,29 @@ func NewWriteConfigFromFlags(flagReg func(name, help string) *kingpin.FlagClause
 		BoolVar(&cfg.OutOfOrder)
 	flagReg("remote-write-v2", "Send remote write v2 format requests.").Default("false").
 		BoolVar(&cfg.WriteV2)
+	var startTimeStr, endTimeStr string
+	flagReg("remote-time-start", "Start time for data generation (RFC3339 format, e.g., 2024-01-01T00:00:00Z). If set, timestamps will progress from this time.").
+		StringVar(&startTimeStr)
+	flagReg("remote-time-end", "End time for data generation (RFC3339 format). If set, timestamps will progress until this time.").
+		StringVar(&endTimeStr)
+	flagReg("remote-sample-interval", "Interval between samples when generating historical data (e.g., 15s, 1m). Defaults to request interval if not set.").
+		DurationVar(&cfg.SampleInterval)
+
+	// Parse time strings after flags are registered
+	if startTimeStr != "" {
+		t, err := time.Parse(time.RFC3339, startTimeStr)
+		if err != nil {
+			log.Fatalf("Failed to parse --remote-time-start: %v", err)
+		}
+		cfg.TimeRangeStart = &t
+	}
+	if endTimeStr != "" {
+		t, err := time.Parse(time.RFC3339, endTimeStr)
+		if err != nil {
+			log.Fatalf("Failed to parse --remote-time-end: %v", err)
+		}
+		cfg.TimeRangeEnd = &t
+	}
 
 	return cfg
 }
@@ -92,16 +118,32 @@ func (c *ConfigWrite) Validate() error {
 			return fmt.Errorf("--remote-write-interval must be greater than 0, got %v", c.RequestInterval)
 		}
 	}
+
+	// Validate time range configuration
+	if c.TimeRangeStart != nil && c.TimeRangeEnd != nil {
+		if c.TimeRangeStart.After(*c.TimeRangeEnd) {
+			return fmt.Errorf("--remote-time-start must be before --remote-time-end")
+		}
+		if c.SampleInterval <= 0 {
+			// Default to request interval if not set
+			c.SampleInterval = c.RequestInterval
+		}
+	} else if c.TimeRangeStart != nil || c.TimeRangeEnd != nil {
+		return fmt.Errorf("both --remote-time-start and --remote-time-end must be set together")
+	}
+
 	return nil
 }
 
 // Writer for remote write requests.
 type Writer struct {
-	logger    *slog.Logger
-	timeout   time.Duration
-	config    *ConfigWrite
-	gatherer  prometheus.Gatherer
-	remoteAPI *remote.API
+	logger         *slog.Logger
+	timeout        time.Duration
+	config         *ConfigWrite
+	gatherer       prometheus.Gatherer
+	remoteAPI      *remote.API
+	currentTime    time.Time // Current timestamp position when using time range
+	currentTimeMtx sync.Mutex // Protects currentTime
 }
 
 // RunRemoteWriting initializes a http client and starts a Writer for remote writing metrics to a prometheus compatible remote endpoint.
@@ -128,6 +170,10 @@ func RunRemoteWriting(ctx context.Context, logger *slog.Logger, cfg *ConfigWrite
 		config:    cfg,
 		gatherer:  gatherer,
 		remoteAPI: remoteAPI,
+	}
+	// Initialize currentTime if time range is configured
+	if cfg.TimeRangeStart != nil {
+		writer.currentTime = *cfg.TimeRangeStart
 	}
 
 	if cfg.WriteV2 {
@@ -183,7 +229,17 @@ func (w *Writer) write(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	tss, err := collectMetrics(w.gatherer, w.config.OutOfOrder)
+	// Determine initial timestamp
+	var initialTimestamp int64
+	if w.config.TimeRangeStart != nil {
+		w.currentTimeMtx.Lock()
+		initialTimestamp = int64(model.TimeFromUnixNano(w.currentTime.UnixNano()))
+		w.currentTimeMtx.Unlock()
+	} else {
+		initialTimestamp = int64(model.Now())
+	}
+
+	tss, err := collectMetrics(w.gatherer, w.config.OutOfOrder, initialTimestamp)
 	if err != nil {
 		return err
 	}
@@ -227,12 +283,20 @@ func (w *Writer) write(ctx context.Context) error {
 		select {
 		case <-w.config.UpdateNotify:
 			log.Println("updating remote write metrics")
-			tss, err = collectMetrics(w.gatherer, w.config.OutOfOrder)
+			var ts int64
+			if w.config.TimeRangeStart != nil {
+				w.currentTimeMtx.Lock()
+				ts = int64(model.TimeFromUnixNano(w.currentTime.UnixNano()))
+				w.currentTimeMtx.Unlock()
+			} else {
+				ts = int64(model.Now())
+			}
+			tss, err = collectMetrics(w.gatherer, w.config.OutOfOrder, ts)
 			if err != nil {
 				merr.Add(err)
 			}
 		default:
-			tss = updateTimetamps(tss)
+			tss = w.updateTimetamps(tss)
 		}
 
 		start := time.Now()
@@ -281,41 +345,63 @@ func (w *Writer) write(ctx context.Context) error {
 	return merr.Err()
 }
 
-func updateTimetamps(tss []prompb.TimeSeries) []prompb.TimeSeries {
-	t := int64(model.Now())
+func (w *Writer) updateTimetamps(tss []prompb.TimeSeries) []prompb.TimeSeries {
+	var t int64
+
+	w.currentTimeMtx.Lock()
+	if w.config.TimeRangeStart != nil && w.config.TimeRangeEnd != nil {
+		// Use current time position in range
+		t = int64(model.TimeFromUnixNano(w.currentTime.UnixNano()))
+
+		// Advance time for next iteration
+		w.currentTime = w.currentTime.Add(w.config.SampleInterval)
+
+		// Check if we've exceeded the end time
+		if w.currentTime.After(*w.config.TimeRangeEnd) {
+			// Reset to start or stop (depending on requirements)
+			// For now, we'll reset to start to allow cycling
+			w.currentTime = *w.config.TimeRangeStart
+		}
+	} else {
+		// Use current time
+		t = int64(model.Now())
+	}
+	w.currentTimeMtx.Unlock()
+
 	for i := range tss {
 		tss[i].Samples[0].Timestamp = t
 	}
 	return tss
 }
 
-func collectMetrics(gatherer prometheus.Gatherer, outOfOrder bool) ([]prompb.TimeSeries, error) {
+func collectMetrics(gatherer prometheus.Gatherer, outOfOrder bool, timestamp int64) ([]prompb.TimeSeries, error) {
 	metricFamilies, err := gatherer.Gather()
 	if err != nil {
 		return nil, err
 	}
-	tss := ToTimeSeriesSlice(metricFamilies)
+	tss := ToTimeSeriesSlice(metricFamilies, timestamp)
 	if outOfOrder {
-		tss = shuffleTimestamps(tss)
+		tss = shuffleTimestamps(tss, timestamp)
 	}
 	return tss, nil
 }
 
-func shuffleTimestamps(tss []prompb.TimeSeries) []prompb.TimeSeries {
-	now := time.Now().UnixMilli()
+func shuffleTimestamps(tss []prompb.TimeSeries, baseTimestamp int64) []prompb.TimeSeries {
+	// baseTimestamp is in milliseconds (model.Time format)
+	// offsets are in milliseconds
 	offsets := []int64{0, -60 * 1000, -5 * 60 * 1000}
 
 	for i := range tss {
 		offset := offsets[i%len(offsets)]
-		tss[i].Samples[0].Timestamp = now + offset
+		tss[i].Samples[0].Timestamp = baseTimestamp + offset
 	}
 	return tss
 }
 
 // ToTimeSeriesSlice converts a slice of metricFamilies containing samples into a slice of TimeSeries
-func ToTimeSeriesSlice(metricFamilies []*dto.MetricFamily) []prompb.TimeSeries {
+func ToTimeSeriesSlice(metricFamilies []*dto.MetricFamily, timestamp int64) []prompb.TimeSeries {
 	tss := make([]prompb.TimeSeries, 0, len(metricFamilies)*10)
-	timestamp := int64(model.Now()) // Not using metric.TimestampMs because it is (always?) nil. Is this right?
+	// timestamp is passed as parameter
 
 	skippedSamples := 0
 	for _, metricFamily := range metricFamilies {

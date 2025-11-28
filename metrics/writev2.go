@@ -37,7 +37,17 @@ func (w *Writer) writeV2(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	tss, st, err := collectMetricsV2(w.gatherer, w.config.OutOfOrder)
+	// Determine initial timestamp
+	var initialTimestamp int64
+	if w.config.TimeRangeStart != nil {
+		w.currentTimeMtx.Lock()
+		initialTimestamp = int64(model.TimeFromUnixNano(w.currentTime.UnixNano()))
+		w.currentTimeMtx.Unlock()
+	} else {
+		initialTimestamp = int64(model.Now())
+	}
+
+	tss, st, err := collectMetricsV2(w.gatherer, w.config.OutOfOrder, initialTimestamp)
 	if err != nil {
 		return err
 	}
@@ -81,12 +91,20 @@ func (w *Writer) writeV2(ctx context.Context) error {
 		select {
 		case <-w.config.UpdateNotify:
 			log.Println("updating remote write metrics")
-			tss, st, err = collectMetricsV2(w.gatherer, w.config.OutOfOrder)
+			var ts int64
+			if w.config.TimeRangeStart != nil {
+				w.currentTimeMtx.Lock()
+				ts = int64(model.TimeFromUnixNano(w.currentTime.UnixNano()))
+				w.currentTimeMtx.Unlock()
+			} else {
+				ts = int64(model.Now())
+			}
+			tss, st, err = collectMetricsV2(w.gatherer, w.config.OutOfOrder, ts)
 			if err != nil {
 				merr.Add(err)
 			}
 		default:
-			tss = updateTimestampsV2(tss)
+			tss = w.updateTimestampsV2(tss)
 		}
 
 		start := time.Now()
@@ -136,40 +154,65 @@ func (w *Writer) writeV2(ctx context.Context) error {
 	return merr.Err()
 }
 
-func updateTimestampsV2(tss []*writev2.TimeSeries) []*writev2.TimeSeries {
-	now := time.Now().UnixMilli()
+func (w *Writer) updateTimestampsV2(tss []*writev2.TimeSeries) []*writev2.TimeSeries {
+	var t int64
+
+	w.currentTimeMtx.Lock()
+	if w.config.TimeRangeStart != nil && w.config.TimeRangeEnd != nil {
+		// Use current time position in range
+		t = w.currentTime.UnixMilli()
+
+		// Advance time for next iteration
+		w.currentTime = w.currentTime.Add(w.config.SampleInterval)
+
+		// Check if we've exceeded the end time
+		if w.currentTime.After(*w.config.TimeRangeEnd) {
+			// Reset to start or stop (depending on requirements)
+			// For now, we'll reset to start to allow cycling
+			w.currentTime = *w.config.TimeRangeStart
+		}
+	} else {
+		// Use current time
+		t = time.Now().UnixMilli()
+	}
+	w.currentTimeMtx.Unlock()
+
 	for i := range tss {
-		tss[i].Samples[0].Timestamp = now
+		tss[i].Samples[0].Timestamp = t
 	}
 	return tss
 }
 
-func shuffleTimestampsV2(tss []*writev2.TimeSeries) []*writev2.TimeSeries {
-	now := time.Now().UnixMilli()
+func shuffleTimestampsV2(tss []*writev2.TimeSeries, baseTimestamp int64) []*writev2.TimeSeries {
+	// baseTimestamp is in milliseconds (model.Time format)
+	// Convert to milliseconds for writev2 (which uses UnixMilli)
+	baseMs := baseTimestamp
 	offsets := []int64{0, -60 * 1000, -5 * 60 * 1000}
 	for i := range tss {
 		offset := offsets[i%len(offsets)]
-		tss[i].Samples[0].Timestamp = now + offset
+		tss[i].Samples[0].Timestamp = baseMs + offset
 	}
 	return tss
 }
 
-func collectMetricsV2(gatherer prometheus.Gatherer, outOfOrder bool) ([]*writev2.TimeSeries, writev2.SymbolsTable, error) {
+func collectMetricsV2(gatherer prometheus.Gatherer, outOfOrder bool, timestamp int64) ([]*writev2.TimeSeries, writev2.SymbolsTable, error) {
 	metricFamilies, err := gatherer.Gather()
 	if err != nil {
 		return nil, writev2.SymbolsTable{}, err
 	}
-	tss, st := ToTimeSeriesSliceV2(metricFamilies)
+	tss, st := ToTimeSeriesSliceV2(metricFamilies, timestamp)
 	if outOfOrder {
-		tss = shuffleTimestampsV2(tss)
+		tss = shuffleTimestampsV2(tss, timestamp)
 	}
 	return tss, st, nil
 }
 
 // ToTimeSeriesSliceV2 converts a slice of metricFamilies containing samples into a slice of writev2.TimeSeries.
-func ToTimeSeriesSliceV2(metricFamilies []*dto.MetricFamily) ([]*writev2.TimeSeries, writev2.SymbolsTable) {
+func ToTimeSeriesSliceV2(metricFamilies []*dto.MetricFamily, timestamp int64) ([]*writev2.TimeSeries, writev2.SymbolsTable) {
 	st := writev2.NewSymbolTable()
-	timestamp := int64(model.Now())
+	// timestamp is passed as parameter in milliseconds (model.Time format)
+	// writev2 uses milliseconds, so no conversion needed
+	timestampMs := timestamp
 	tss := make([]*writev2.TimeSeries, 0, len(metricFamilies)*10)
 
 	skippedSamples := 0
@@ -188,13 +231,13 @@ func ToTimeSeriesSliceV2(metricFamilies []*dto.MetricFamily) ([]*writev2.TimeSer
 			case dto.MetricType_COUNTER:
 				ts.Samples = []*writev2.Sample{{
 					Value:     *metric.Counter.Value,
-					Timestamp: timestamp,
+					Timestamp: timestampMs,
 				}}
 				tss = append(tss, ts)
 			case dto.MetricType_GAUGE:
 				ts.Samples = []*writev2.Sample{{
 					Value:     *metric.Gauge.Value,
-					Timestamp: timestamp,
+					Timestamp: timestampMs,
 				}}
 				tss = append(tss, ts)
 			default:
